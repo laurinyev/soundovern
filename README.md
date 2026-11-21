@@ -40,6 +40,15 @@ Playback uses Oboe (AAudio, exclusive/MMAP when the device allows; OpenSL ES on 
 - **USB instead of Wi-Fi:** enable USB tethering on the phone (no USB debugging needed), find the desktop's address on the new interface with `ip -4 addr`, and connect to that `IP:7420`. adb-based tunnels carry only TCP, so they are not suitable.
 - **Bluetooth headphones** on the phone add 100–200 ms on their own.
 
+## License and privacy
+Soundovern is licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Third-party components and their licenses are listed in [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)
+(regenerate with `python3 tools/gen_notices.py`; it also refreshes the copies bundled in the app).
+The privacy policy is in [PRIVACY.md](PRIVACY.md): no accounts, analytics or servers; nothing leaves your network.
+The app also shows these under *Made with AI · About → Privacy & licenses*.
+
+This project was written with the help of an AI assistant (Claude) and has not had an independent security review.
+
 ## Layout
 `crates/soundovern-proto` wire format · `soundovern-core` codec/jitter/drift/client engine · `soundovern-server` · `soundovern-cli-client` · `soundovern-android-ffi` · `android/` app.
 Protocol: UDP datagram = 19-byte header (magic, ver, flags, session, seq, 48 kHz timestamp, len) + one Opus frame; control = length-prefixed postcard over TCP. See `crates/soundovern-proto/src/lib.rs`.

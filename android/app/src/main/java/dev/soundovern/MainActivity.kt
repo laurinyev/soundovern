@@ -12,6 +12,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
@@ -81,6 +86,7 @@ private fun Screen(
     var muted by remember { mutableStateOf(StreamService.muted) }
     var volume by remember { mutableFloatStateOf(prefs.getFloat("volume", 1f)) }
     var showAbout by remember { mutableStateOf(!prefs.getBoolean("ai_notice_ack", false)) }
+    var showLegal by remember { mutableStateOf(false) }
     val firstRun = !prefs.getBoolean("ai_notice_ack", false)
 
     LaunchedEffect(Unit) {
@@ -95,10 +101,11 @@ private fun Screen(
         if (stats.phase == Phase.PLAYING && StreamService.handle != 0L) NativeEngine.nativeSetVolume(StreamService.handle, volume)
     }
 
-    if (showAbout) AiNotice(firstRun = firstRun) {
+    if (showAbout) AiNotice(firstRun = firstRun, onLegal = { showLegal = true }) {
         prefs.edit().putBoolean("ai_notice_ack", true).apply()
         showAbout = false
     }
+    if (showLegal) LegalScreen { showLegal = false }
 
     Column(
         Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 12.dp),
@@ -296,7 +303,7 @@ private fun Field(value: String, onChange: (String) -> Unit, label: String, hint
 }
 
 @Composable
-private fun AiNotice(firstRun: Boolean, onDone: () -> Unit) {
+private fun AiNotice(firstRun: Boolean, onLegal: () -> Unit, onDone: () -> Unit) {
     AlertDialog(
         onDismissRequest = { if (!firstRun) onDone() }, // the first-run notice must be acknowledged
         containerColor = Palette.Surface,
@@ -319,5 +326,50 @@ private fun AiNotice(firstRun: Boolean, onDone: () -> Unit) {
         confirmButton = {
             TextButton(onClick = onDone) { Text(if (firstRun) "Got it" else "Close", color = Palette.Clay, style = MaterialTheme.typography.labelLarge) }
         },
+        dismissButton = {
+            TextButton(onClick = onLegal) { Text("Privacy & licenses", color = Palette.Muted, style = MaterialTheme.typography.labelLarge) }
+        },
     )
+}
+
+private val LEGAL_TABS = listOf("Privacy" to "PRIVACY.txt", "License" to "LICENSE.txt", "Third-party" to "THIRD_PARTY_LICENSES.txt")
+
+/** Full-screen viewer for the bundled privacy policy, license and third-party notices. */
+@Composable
+private fun LegalScreen(onClose: () -> Unit) {
+    val context = LocalContext.current
+    var tab by remember { mutableIntStateOf(0) }
+    // The third-party file is large, so show it as paragraphs in a lazy list rather than one huge Text.
+    val paragraphs by produceState(initialValue = listOf("Loading…"), tab) {
+        value = try {
+            context.assets.open(LEGAL_TABS[tab].second).bufferedReader().use { it.readText() }.split("\n\n").filter { it.isNotBlank() }
+        } catch (e: Exception) {
+            listOf("Couldn't load this document: ${e.message}")
+        }
+    }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize(), color = Palette.Bg) {
+            Column(Modifier.systemBarsPadding()) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Text("Privacy & licenses", fontFamily = Serif, fontSize = 22.sp, color = Palette.Text, modifier = Modifier.weight(1f).padding(start = 8.dp))
+                    TextButton(onClick = onClose) { Text("Close", color = Palette.Clay) }
+                }
+                Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    LEGAL_TABS.forEachIndexed { i, (name, _) ->
+                        val sel = i == tab
+                        Text(
+                            name, style = MaterialTheme.typography.labelLarge, color = if (sel) Palette.Bg else Palette.Muted,
+                            modifier = Modifier.clip(RoundedCornerShape(50)).background(if (sel) Palette.Clay else Palette.Surface)
+                                .clickable { tab = i }.padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+                LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp), contentPadding = PaddingValues(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items(paragraphs) { para ->
+                        Text(para, style = MaterialTheme.typography.bodySmall, color = Palette.Text.copy(alpha = 0.9f), fontFamily = if (tab == 0) FontFamily.SansSerif else FontFamily.Monospace)
+                    }
+                }
+            }
+        }
+    }
 }
