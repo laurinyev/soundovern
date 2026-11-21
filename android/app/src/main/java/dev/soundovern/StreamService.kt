@@ -86,8 +86,8 @@ class StreamService : Service() {
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .setBufferSizeInBytes(minBuf)
                 .build()
-            // Shrink the device queue to ~2 hardware bursts, grow it only if we underrun.
-            var bufFrames = track.setBufferSizeInFrames(burst * 2).coerceAtLeast(burst)
+            // Shrink the device queue to 1 hardware burst, grow it only if we underrun.
+            var bufFrames = track.setBufferSizeInFrames(burst).coerceAtLeast(burst)
             val maxFrames = track.bufferCapacityInFrames
             var lastUnderruns = 0
             track.play()
