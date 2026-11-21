@@ -4,6 +4,9 @@
 use jni::objects::{JClass, JFloatArray, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::JNIEnv;
+#[cfg(target_os = "android")]
+mod audio;
+
 use soundovern_core::client::{ClientConfig, ConnState, Engine};
 use std::sync::{Arc, Mutex};
 
@@ -97,5 +100,57 @@ pub extern "system" fn Java_dev_soundovern_NativeEngine_nativeStop(_env: JNIEnv,
     if h != 0 {
         let e = unsafe { Arc::from_raw(h as *const Engine) };
         e.stop();
+    }
+}
+
+/// Borrow the engine behind a handle as an `Arc` (bumping the refcount).
+///
+/// # Safety
+/// `h` must be a live handle from `nativeStart`.
+#[cfg(target_os = "android")]
+unsafe fn engine_arc(h: jlong) -> Option<Arc<Engine>> {
+    if h == 0 {
+        return None;
+    }
+    let p = h as *const Engine;
+    Arc::increment_strong_count(p);
+    Some(Arc::from_raw(p))
+}
+
+/// Starts the Oboe output stream for an engine. Returns an audio handle, or 0 (see `nativeLastError`).
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_soundovern_NativeEngine_nativeAudioStart(_env: JNIEnv, _c: JClass, h: jlong) -> jlong {
+    let Some(e) = (unsafe { engine_arc(h) }) else { return 0 };
+    match audio::AudioOut::start(e) {
+        Ok(a) => Box::into_raw(Box::new(a)) as jlong,
+        Err(m) => {
+            set_err(m);
+            0
+        }
+    }
+}
+
+/// Returns [outputLatencyMs, bufferFrames, burstFrames, xruns, exclusive(0/1), reopens].
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_soundovern_NativeEngine_nativeAudioInfo<'l>(env: JNIEnv<'l>, _c: JClass, a: jlong) -> JFloatArray<'l> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let out = env.new_float_array(6).expect("float array");
+    if a != 0 {
+        let a = unsafe { &*(a as *const audio::AudioOut) };
+        let i = &a.info;
+        let v = [i.latency_ms(), i.buffer_frames.load(Relaxed) as f32, i.burst_frames.load(Relaxed) as f32, i.xruns.load(Relaxed) as f32, i.exclusive.load(Relaxed) as u8 as f32, i.reopens.load(Relaxed) as f32];
+        let _ = env.set_float_array_region(&out, 0, &v);
+    }
+    out
+}
+
+/// Stops and frees the audio output. Must be called before `nativeStop`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_dev_soundovern_NativeEngine_nativeAudioStop(_env: JNIEnv, _c: JClass, a: jlong) {
+    if a != 0 {
+        unsafe { Box::from_raw(a as *mut audio::AudioOut) }.stop();
     }
 }

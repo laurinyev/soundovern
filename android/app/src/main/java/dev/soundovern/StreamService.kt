@@ -10,7 +10,7 @@ import android.os.*
 import androidx.core.app.NotificationCompat
 import kotlin.concurrent.thread
 
-/** Foreground service: owns the engine handle and the low-latency AudioTrack render loop. */
+/** Foreground service: owns the engine handle; audio is rendered by the native Oboe stream. */
 class StreamService : Service() {
     companion object {
         const val ACTION_START = "dev.soundovern.START"
@@ -60,60 +60,36 @@ class StreamService : Service() {
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "soundovern:stream").apply { acquire() }
         requestFocus()
 
-        audioThread = thread(name = "sn-audio", priority = Thread.MAX_PRIORITY) {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        audioThread = thread(name = "sn-engine") {
             val h = NativeEngine.nativeStart(server, pin, Build.MODEL, 20, 120)
             if (h == 0L) {
                 status = "Failed: ${NativeEngine.nativeLastError()}"
-                running = false
                 shutdown(); return@thread
             }
             handle = h
-            val rate = 48000
-            val chunkFrames = 240 // 5 ms: finer pulls keep the jitter buffer depth steadier
-            val chunk = chunkFrames * 2
-            val am = getSystemService(AUDIO_SERVICE) as AudioManager
-            val burst = am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)?.toIntOrNull()?.takeIf { it > 0 } ?: 192
-            val minBuf = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_FLOAT)
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-                .setAudioFormat(AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT).setSampleRate(rate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
-                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .setBufferSizeInBytes(minBuf)
-                .build()
-            // Shrink the device queue to 1 hardware burst, grow it only if we underrun.
-            var bufFrames = track.setBufferSizeInFrames(burst).coerceAtLeast(burst)
-            val maxFrames = track.bufferCapacityInFrames
-            var lastUnderruns = 0
-            track.play()
-            val buf = FloatArray(chunk)
-            var lastUi = 0L
-            while (!stopping) {
-                NativeEngine.nativeRender(h, buf, chunk)
-                track.write(buf, 0, chunk, AudioTrack.WRITE_BLOCKING) // paces us to the device clock
-                val u = track.underrunCount
-                if (u > lastUnderruns && bufFrames < maxFrames) {
-                    lastUnderruns = u
-                    bufFrames = track.setBufferSizeInFrames(minOf(bufFrames + burst, maxFrames))
-                }
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastUi > 1000) { lastUi = now; updateStatus(h, bufFrames * 1000 / rate) }
+            val audio = NativeEngine.nativeAudioStart(h)
+            if (audio == 0L) {
+                status = "Failed: ${NativeEngine.nativeLastError()}"
+                NativeEngine.nativeStop(h); handle = 0
+                shutdown(); return@thread
             }
-            track.stop(); track.release()
-            NativeEngine.nativeStop(h) // safe: render loop has exited
+            // The audio callback runs natively; this thread only reports status.
+            while (!stopping) {
+                updateStatus(h, audio)
+                try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+            }
+            NativeEngine.nativeAudioStop(audio) // stop the callback before freeing the engine
+            NativeEngine.nativeStop(h)
             handle = 0
         }
     }
 
-    private fun updateStatus(h: Long, outMs: Int) {
+    private fun updateStatus(h: Long, audio: Long) {
         val s = NativeEngine.nativeStats(h)
+        val a = NativeEngine.nativeAudioInfo(audio)
         status = when (s[0].toInt()) {
-            0 -> "Playing · jitter buf %.0f ms · out %d ms · lost %.0f · underruns %.0f".format(s[6], outMs, s[2], s[4])
+            0 -> "Playing · jitter buf %.0f ms · out %.0f ms%s · lost %.0f · underruns %.0f · xruns %.0f".format(
+                s[6], a[0], if (a[4] > 0f) " (exclusive)" else "", s[2], s[4], a[3])
             1 -> "Reconnecting…"
             else -> "Stopped"
         }
@@ -167,7 +143,7 @@ class StreamService : Service() {
     private fun shutdown() {
         stopping = true
         val t = audioThread
-        if (t != null && t != Thread.currentThread()) t.join(1000)
+        if (t != null && t != Thread.currentThread()) { t.interrupt(); t.join(2000) }
         focus?.let { (getSystemService(AUDIO_SERVICE) as AudioManager).abandonAudioFocusRequest(it) }
         wifiLock?.takeIf { it.isHeld }?.release()
         wakeLock?.takeIf { it.isHeld }?.release()

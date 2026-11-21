@@ -33,7 +33,7 @@ cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o android/app/src/main/jniLibs 
 cd android && echo "sdk.dir=$ANDROID_HOME" > local.properties && ./gradlew assembleDebug
 # APK: android/app/build/outputs/apk/debug/app-debug.apk
 ```
-Playback uses `AudioTrack` in `PERFORMANCE_MODE_LOW_LATENCY` with a device buffer of ~2 hardware bursts that grows on underruns. Oboe is a possible later optimisation.
+Playback uses Oboe (AAudio, exclusive/MMAP when the device allows; OpenSL ES on old phones) with the callback in Rust. The device buffer starts at 2 bursts and grows one burst per xrun; the stream reopens on route changes.
 
 ## Tips
 - **Echo:** playing the same audio on desktop speakers and the phone sounds like an echo (the phone is ~50–100 ms later). Use `--silent-local`, or mute the desktop.
@@ -45,6 +45,6 @@ Playback uses `AudioTrack` in `PERFORMANCE_MODE_LOW_LATENCY` with a device buffe
 Protocol: UDP datagram = 19-byte header (magic, ver, flags, session, seq, 48 kHz timestamp, len) + one Opus frame; control = length-prefixed postcard over TCP. See `crates/soundovern-proto/src/lib.rs`.
 
 ## Known gaps / next steps
-- Oboe backend; QR pairing; media encryption (PIN is checked in plaintext today – LAN-grade only).
+- QR pairing; media encryption (PIN is checked in plaintext today – LAN-grade only).
 - Single client at a time (a new client replaces the old one).
 - Latency not yet measured glass-to-glass (see plan: chirp cross-correlation rig).

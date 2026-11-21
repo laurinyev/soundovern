@@ -11,3 +11,6 @@ soundovern-proto = { version = "0.1.0", path = "../soundovern-proto" }
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+oboe = "0.6.1"
