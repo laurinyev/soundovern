@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 struct Opt {
     /// Server address, host or host:port
     server: String,
+    /// Pairing PIN shown by the server
     #[arg(long)]
-    pin: Option<String>,
+    pin: String,
     /// Minimum jitter buffer in ms
     #[arg(long, default_value_t = 20)]
     min_ms: u32,

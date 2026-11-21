@@ -34,8 +34,7 @@ pub extern "system" fn Java_dev_soundovern_NativeEngine_nativeStart(
 ) -> jlong {
     let get = |env: &mut JNIEnv, s: &JString| -> String { env.get_string(s).map(|s| s.into()).unwrap_or_default() };
     let mut cfg = ClientConfig::new(get(&mut env, &server));
-    let pin = get(&mut env, &pin);
-    cfg.pin = (!pin.is_empty()).then_some(pin);
+    cfg.pin = get(&mut env, &pin);
     cfg.client_name = get(&mut env, &name);
     cfg.min_ms = min_ms.max(10) as u32;
     cfg.max_ms = max_ms.max(min_ms + 10) as u32;

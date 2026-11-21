@@ -7,6 +7,7 @@
 use crate::codec::OpusDec;
 use crate::drift::{DriftController, LinearResampler};
 use crate::jitter::{JitterBuffer, JitterStats, Pop};
+use soundovern_proto::crypto::{self, MediaCipher, Session};
 use soundovern_proto::*;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -17,7 +18,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub server: String,
-    pub pin: Option<String>,
+    /// Pairing PIN shown by the server.
+    pub pin: String,
     pub client_name: String,
     pub min_ms: u32,
     pub max_ms: u32,
@@ -27,7 +29,7 @@ pub struct ClientConfig {
 
 impl ClientConfig {
     pub fn new(server: impl Into<String>) -> Self {
-        Self { server: server.into(), pin: None, client_name: "client".into(), min_ms: 20, max_ms: 120, sim_loss_pct: 0.0 }
+        Self { server: server.into(), pin: String::new(), client_name: "client".into(), min_ms: 20, max_ms: 120, sim_loss_pct: 0.0 }
     }
 }
 
@@ -99,20 +101,36 @@ fn resolve(server: &str) -> std::io::Result<SocketAddr> {
     s.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot resolve server"))
 }
 
-fn connect(addr: SocketAddr, udp_port: u16, cfg: &ClientConfig) -> Result<(TcpStream, StreamParams, u16), String> {
+struct Connected {
+    tcp: TcpStream,
+    sess: Session,
+    params: StreamParams,
+    session_id: u16,
+}
+
+/// TCP connect + SPAKE2 handshake. Fails with a readable message for a wrong PIN or refusal.
+fn connect(addr: SocketAddr, udp_port: u16, cfg: &ClientConfig) -> Result<Connected, String> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| format!("connect: {e}"))?;
     let _ = s.set_nodelay(true);
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-    Control::Hello { proto_version: PROTO_VERSION, client_name: cfg.client_name.clone(), udp_port, pin: cfg.pin.clone() }
+    let (pending, my_msg) = crypto::client_start(&cfg.pin);
+    Control::Hello { proto_version: PROTO_VERSION, client_name: cfg.client_name.clone(), udp_port, pake: my_msg }
         .write_to(&mut s)
         .map_err(|e| e.to_string())?;
-    match Control::read_from(&mut s).map_err(|e| e.to_string())? {
-        Control::Accept { session_id, params, server_name } => {
-            tracing::info!("connected to '{server_name}' session {session_id}");
-            Ok((s, params, session_id))
+    let server_msg = match Control::read_from(&mut s).map_err(|e| format!("handshake: {e}"))? {
+        Control::HelloReply { pake } => pake,
+        Control::Reject { reason } => return Err(format!("rejected: {reason}")),
+        o => return Err(format!("unexpected message {o:?}")),
+    };
+    let mut sess = pending.finish(&server_msg).map_err(|e| e.to_string())?;
+    sess.write_to(&mut s, &Control::Ready).map_err(|e| e.to_string())?;
+    match sess.read_from(&mut s) {
+        Ok(Control::Accept { session_id, params, server_name }) => {
+            tracing::info!("connected to '{server_name}' session {session_id} (encrypted)");
+            Ok(Connected { tcp: s, sess, params, session_id })
         }
-        Control::Reject { reason } => Err(format!("rejected: {reason}")),
-        o => Err(format!("unexpected message {o:?}")),
+        Ok(o) => Err(format!("unexpected message {o:?}")),
+        Err(_) => Err("pairing failed: wrong PIN, or the server refused the connection".into()),
     }
 }
 
@@ -123,7 +141,8 @@ impl Engine {
         let udp = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
         udp.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
         let udp_port = udp.local_addr().map_err(|e| e.to_string())?.port();
-        let (ctl, params, sid) = connect(addr, udp_port, &cfg)?;
+        let Connected { tcp: ctl, sess, params, session_id: sid } = connect(addr, udp_port, &cfg)?;
+        let media = Arc::new(Mutex::new(sess.media()));
 
         let jb = Arc::new(Mutex::new(JitterBuffer::new(params.frame_ms, cfg.min_ms, cfg.max_ms)));
         let dec = OpusDec::new(&params).map_err(|e| e.to_string())?;
@@ -150,17 +169,20 @@ impl Engine {
 
         // UDP receiver
         {
-            let (jb, sid, running, udp) = (jb.clone(), session_id.clone(), eng.running.clone(), udp);
+            let (jb, sid, running, udp, media) = (jb.clone(), session_id.clone(), eng.running.clone(), udp, media.clone());
             let sim = cfg.sim_loss_pct;
             std::thread::Builder::new().name("sn-udp".into()).spawn(move || {
                 let mut buf = [0u8; 2048];
                 let mut rng = 0x1234_5678u32;
                 while running.load(Ordering::Relaxed) {
                     let Ok(n) = udp.recv(&mut buf) else { continue };
-                    let Ok((h, payload)) = MediaHeader::parse(&buf[..n]) else { continue };
-                    if h.session_id != sid.load(Ordering::Relaxed) {
+                    // Quick plaintext-header check first, then authenticate + decrypt.
+                    let Ok((h0, _)) = MediaHeader::parse(&buf[..n]) else { continue };
+                    if h0.session_id != sid.load(Ordering::Relaxed) {
                         continue;
                     }
+                    let cipher: MediaCipher = media.lock().unwrap().clone();
+                    let Ok((h, payload)) = cipher.open(&buf[..n]) else { continue };
                     rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
                     if sim > 0.0 && ((rng >> 8) as f32 / (1u32 << 24) as f32) * 100.0 < sim {
                         continue;
@@ -169,7 +191,7 @@ impl Engine {
                     if h.flags & flags::DISCONT != 0 {
                         g.reset();
                     }
-                    g.push(h.seq, payload.to_vec(), Instant::now());
+                    g.push(h.seq, payload, Instant::now());
                 }
             }).map_err(|e| e.to_string())?;
         }
@@ -177,7 +199,7 @@ impl Engine {
         // Control: keepalive, reports, reconnect
         {
             let eng2 = eng.clone();
-            std::thread::Builder::new().name("sn-ctl".into()).spawn(move || control_loop(eng2, ctl, addr, udp_port, cfg, session_id)).map_err(|e| e.to_string())?;
+            std::thread::Builder::new().name("sn-ctl".into()).spawn(move || control_loop(eng2, ctl, sess, addr, udp_port, cfg, session_id, media)).map_err(|e| e.to_string())?;
         }
         Ok(eng)
     }
@@ -222,7 +244,8 @@ impl Engine {
     }
 }
 
-fn control_loop(eng: Arc<Engine>, mut ctl: TcpStream, addr: SocketAddr, udp_port: u16, cfg: ClientConfig, sid: Arc<AtomicU16>) {
+#[allow(clippy::too_many_arguments)]
+fn control_loop(eng: Arc<Engine>, mut ctl: TcpStream, mut sess: Session, addr: SocketAddr, udp_port: u16, cfg: ClientConfig, sid: Arc<AtomicU16>, media: Arc<Mutex<MediaCipher>>) {
     let mut last = JitterStats::default();
     let mut nonce = 0u64;
     let mut backoff = Duration::from_millis(500);
@@ -230,7 +253,7 @@ fn control_loop(eng: Arc<Engine>, mut ctl: TcpStream, addr: SocketAddr, udp_port
         // 1 s tick, but wake quickly on stop
         for _ in 0..10 {
             if !eng.running.load(Ordering::Relaxed) {
-                let _ = Control::Stop.write_to(&mut ctl);
+                let _ = sess.write_to(&mut ctl, &Control::Stop);
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -242,18 +265,20 @@ fn control_loop(eng: Arc<Engine>, mut ctl: TcpStream, addr: SocketAddr, udp_port
         };
         tracing::info!("rx={} lost={} late={} underruns={} jitter={jitter:.1}ms buf={buf:.0}ms", stats.received, stats.lost, stats.late, stats.underruns);
         let res = (|| -> std::io::Result<()> {
-            Control::Ping { nonce }.write_to(&mut ctl)?;
-            Control::Stats {
-                received: stats.received.wrapping_sub(last.received),
-                lost: stats.lost.wrapping_sub(last.lost),
-                late: stats.late.wrapping_sub(last.late),
-                jitter_ms: jitter,
-                buffer_ms: buf,
-            }
-            .write_to(&mut ctl)?;
+            sess.write_to(&mut ctl, &Control::Ping { nonce })?;
+            sess.write_to(
+                &mut ctl,
+                &Control::Stats {
+                    received: stats.received.wrapping_sub(last.received),
+                    lost: stats.lost.wrapping_sub(last.lost),
+                    late: stats.late.wrapping_sub(last.late),
+                    jitter_ms: jitter,
+                    buffer_ms: buf,
+                },
+            )?;
             ctl.set_read_timeout(Some(Duration::from_millis(50)))?;
             loop {
-                match Control::read_from(&mut ctl) {
+                match sess.read_from(&mut ctl) {
                     Ok(Control::Stop) => return Err(std::io::ErrorKind::ConnectionAborted.into()),
                     Ok(_) => {}
                     Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(()),
@@ -270,9 +295,11 @@ fn control_loop(eng: Arc<Engine>, mut ctl: TcpStream, addr: SocketAddr, udp_port
                     return;
                 }
                 match connect(addr, udp_port, &cfg) {
-                    Ok((c, _, id)) => {
-                        ctl = c;
-                        sid.store(id, Ordering::Relaxed);
+                    Ok(c) => {
+                        ctl = c.tcp;
+                        *media.lock().unwrap() = c.sess.media();
+                        sess = c.sess;
+                        sid.store(c.session_id, Ordering::Relaxed);
                         eng.jb.lock().unwrap().reset();
                         eng.connected.store(true, Ordering::Relaxed);
                         backoff = Duration::from_millis(500);

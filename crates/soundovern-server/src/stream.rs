@@ -70,7 +70,6 @@ pub fn run(rx: Receiver<rtrb::Consumer<f32>>, sock: std::net::UdpSocket, sh: Arc
             chunk.commit_all();
             last_data = Instant::now();
             next_silence = last_data + frame_dur;
-            pkt.clear();
             let payload = match enc.encode(&pcm) {
                 Ok(p) => p.to_vec(),
                 Err(e) => {
@@ -78,14 +77,12 @@ pub fn run(rx: Receiver<rtrb::Consumer<f32>>, sock: std::net::UdpSocket, sh: Arc
                     continue;
                 }
             };
-            MediaHeader { flags, session_id: sess.id, seq, timestamp: ts, payload_len: payload.len() as u16 }.write(&mut pkt);
-            pkt.extend_from_slice(&payload);
+            sess.media.seal(flags, sess.id, seq, ts, &payload, &mut pkt);
         } else if last_data.elapsed() > frame_dur * 3 && Instant::now() >= next_silence {
             // Capture stalled (suspended sink / PipeWire restart): keep the client fed with silence.
             next_silence += frame_dur;
             flags |= flags::SILENCE;
-            pkt.clear();
-            MediaHeader { flags, session_id: sess.id, seq, timestamp: ts, payload_len: 0 }.write(&mut pkt);
+            sess.media.seal(flags, sess.id, seq, ts, &[], &mut pkt);
         } else {
             std::thread::sleep(Duration::from_millis(1));
             continue;

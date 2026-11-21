@@ -3,10 +3,12 @@
 //! * Media: UDP datagrams = [`MediaHeader`] (19 bytes) + one Opus frame.
 //! * Control: TCP, each message is `u32 BE length` + postcard-encoded [`Control`].
 
+pub mod crypto;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTO_VERSION: u8 = 1;
+pub const PROTO_VERSION: u8 = 2;
 pub const MAGIC: u8 = 0x53; // 'S'
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
@@ -109,9 +111,14 @@ impl StreamParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Control {
-    /// Client → server. `udp_port` is where the client listens for media.
-    Hello { proto_version: u8, client_name: String, udp_port: u16, pin: Option<String> },
-    /// Server → client.
+    /// Client → server (plaintext). `udp_port` is where the client listens for media; `pake` is the
+    /// client's SPAKE2 message.
+    Hello { proto_version: u8, client_name: String, udp_port: u16, pake: Vec<u8> },
+    /// Server → client (plaintext): the server's SPAKE2 message. Everything after this is encrypted.
+    HelloReply { pake: Vec<u8> },
+    /// Client → server (encrypted): proves the client derived the same key, i.e. knows the PIN.
+    Ready,
+    /// Server → client (encrypted).
     Accept { session_id: u16, params: StreamParams, server_name: String },
     Reject { reason: String },
     Ping { nonce: u64 },
@@ -181,7 +188,7 @@ mod tests {
 
     #[test]
     fn control_roundtrip() {
-        let m = Control::Accept { session_id: 3, params: StreamParams::default(), server_name: "x".into() };
+        let m = Control::Hello { proto_version: PROTO_VERSION, client_name: "x".into(), udp_port: 5, pake: vec![1, 2, 3] };
         let b = m.encode().unwrap();
         let m2 = Control::read_from(&mut &b[..]).unwrap();
         assert_eq!(m, m2);

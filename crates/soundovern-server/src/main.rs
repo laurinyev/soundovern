@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use soundovern_proto::*;
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ struct Opt {
     /// Name advertised to clients
     #[arg(long)]
     name: Option<String>,
-    /// Require clients to present this PIN
+    /// Pairing PIN (default: a random 6-digit PIN, created once and stored in ~/.config/soundovern/pin)
     #[arg(long)]
     pin: Option<String>,
     /// Capture a specific PipeWire node (name or id) instead of the default sink monitor
@@ -75,14 +75,11 @@ fn main() -> Result<()> {
     }
 
     let name = opt.name.clone().unwrap_or_else(hostname);
-    let shared = Arc::new(session::Shared {
-        params: params.clone(),
-        server_name: name.clone(),
-        pin: opt.pin.clone(),
-        active: Mutex::new(None),
-        next_id: AtomicU16::new(1),
-        loss_hint: AtomicI32::new(0),
-    });
+    let pin = match &opt.pin {
+        Some(p) => p.clone(),
+        None => load_or_create_pin()?,
+    };
+    let shared = Arc::new(session::Shared::new(params.clone(), name.clone(), pin.clone()));
 
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("udp bind")?;
     {
@@ -100,7 +97,8 @@ fn main() -> Result<()> {
     if let Some(ip) = local_ip() {
         tracing::info!("connect clients to {ip}:{}", opt.port);
     }
-    let _mdns = if opt.no_mdns { None } else { advertise(&name, opt.port, opt.pin.is_some()) };
+    println!("\n  Pairing PIN: {pin}\n  (enter it in the app; audio and control are end-to-end encrypted with a key derived from it)\n");
+    let _mdns = if opt.no_mdns { None } else { advertise(&name, opt.port) };
 
     if opt.silent_local {
         let silent = Arc::new(Mutex::new(silent::SilentLocal::default()));
@@ -141,6 +139,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// A random 6-digit PIN, generated once and kept in `$XDG_CONFIG_HOME/soundovern/pin` (mode 0600).
+fn load_or_create_pin() -> Result<String> {
+    use rand_core::{OsRng, RngCore};
+    use std::os::unix::fs::OpenOptionsExt;
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .context("cannot locate a config directory (set --pin)")?;
+    let dir = base.join("soundovern");
+    let file = dir.join("pin");
+    if let Ok(s) = std::fs::read_to_string(&file) {
+        let s = s.trim().to_string();
+        if s.len() >= 6 && s.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(s);
+        }
+    }
+    std::fs::create_dir_all(&dir)?;
+    let pin = format!("{:06}", OsRng.next_u32() % 1_000_000);
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&file)?;
+    std::io::Write::write_all(&mut f, pin.as_bytes())?;
+    tracing::info!("created new pairing PIN, stored in {}", file.display());
+    Ok(pin)
+}
+
 fn local_ip() -> Option<IpAddr> {
     // Route-based detection; no packets are sent for a UDP connect().
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -148,10 +170,10 @@ fn local_ip() -> Option<IpAddr> {
     s.local_addr().ok().map(|a| a.ip())
 }
 
-fn advertise(name: &str, port: u16, pin: bool) -> Option<mdns_sd::ServiceDaemon> {
+fn advertise(name: &str, port: u16) -> Option<mdns_sd::ServiceDaemon> {
     let d = mdns_sd::ServiceDaemon::new().ok()?;
     let host = format!("{}.local.", hostname());
-    let props = [("ver", PROTO_VERSION.to_string()), ("pin", (pin as u8).to_string())];
+    let props = [("ver", PROTO_VERSION.to_string())];
     let info = mdns_sd::ServiceInfo::new(MDNS_SERVICE, name, &host, "", port, &props[..]).ok()?.enable_addr_auto();
     d.register(info).ok()?;
     tracing::info!("mDNS: advertising {MDNS_SERVICE}");

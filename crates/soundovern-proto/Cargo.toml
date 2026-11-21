@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
 postcard = { version = "1.2.0", features = ["use-std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.10"
+spake2 = "0.4"
+subtle = "2"
 thiserror = "2.0.21"

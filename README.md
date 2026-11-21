@@ -15,11 +15,11 @@ with low latency. Rust server, Opus over UDP, adaptive jitter buffer, Kotlin app
 ## Quick start (desktop)
 ```sh
 cargo run --release -p soundovern-server            # prints the address to connect to
-cargo run --release -p soundovern-cli-client -- 192.168.x.y   # on another machine (a local client would feed back into the capture!)
+cargo run --release -p soundovern-cli-client -- 192.168.x.y --pin <PIN>   # on another machine (a local client would feed back into the capture!)
 ./tools/loopback-test.sh 5                          # headless self-test with 5 % simulated loss
 cargo run -p soundovern-server -- --probe 3 --wav /tmp/p.wav   # capture-only sanity check
 ```
-Options: `--silent-local` (mute desktop output while a client is connected; restores on disconnect/exit), `--pin 1234`, `--bitrate`, `--frame-ms 5|10|20`, `--target <pw node>` (instead of default sink), `--no-fec`, `--bind`.
+Options: `--pin 123456` (default: random 6-digit PIN created once in `~/.config/soundovern/pin`), `--silent-local` (mute desktop output while a client is connected; restores on disconnect/exit), `--bitrate`, `--frame-ms 5|10|20`, `--target <pw node>` (instead of default sink), `--no-fec`, `--bind`.
 Ports: TCP 7420 (control) and an ephemeral UDP port on the client (media, server→client). Open TCP 7420 on the desktop firewall.
 Optional: `packaging/soundovern.service` as a systemd *user* unit.
 
@@ -43,6 +43,16 @@ Playback uses Oboe (AAudio, exclusive/MMAP when the device allows; OpenSL ES on 
 ## Layout
 `crates/soundovern-proto` wire format · `soundovern-core` codec/jitter/drift/client engine · `soundovern-server` · `soundovern-cli-client` · `soundovern-android-ffi` · `android/` app.
 Protocol: UDP datagram = 19-byte header (magic, ver, flags, session, seq, 48 kHz timestamp, len) + one Opus frame; control = length-prefixed postcard over TCP. See `crates/soundovern-proto/src/lib.rs`.
+
+## Security
+Pairing uses **SPAKE2** (PIN-authenticated key exchange): the PIN never crosses the network and an
+eavesdropper cannot brute-force it offline; an active attacker gets one guess per attempt, and the server
+locks out handshakes for 30 s (doubling, max 5 min) after 5 consecutive failures (a trade-off: someone
+on your LAN can also trigger that lockout). From the shared secret, HKDF derives separate keys; control
+messages and every audio packet are encrypted and authenticated with **ChaCha20-Poly1305** (media header
+authenticated as AAD, nonce = seq || capture timestamp, control uses counters). The server streams nothing
+until the client proves it knows the PIN. Not covered: traffic analysis (packet sizes/timing), a PIN
+shoulder-surfed by someone on the LAN, and a compromised desktop or phone. Protocol version 2 (v1 clients are refused).
 
 ## Known gaps / next steps
 - QR pairing; media encryption (PIN is checked in plaintext today – LAN-grade only).

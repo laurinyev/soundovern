@@ -37,7 +37,7 @@ class MainActivity : ComponentActivity() {
                     Column(Modifier.padding(16.dp).statusBarsPadding(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Soundovern", style = MaterialTheme.typography.headlineMedium)
                         OutlinedTextField(server, { server = it }, label = { Text("Server (IP or IP:port)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                        OutlinedTextField(pin, { pin = it }, label = { Text("PIN (if set)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(pin, { pin = it }, label = { Text("PIN (shown by the server)") }, keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword), singleLine = true, modifier = Modifier.fillMaxWidth())
                         Button(onClick = {
                             if (running) startService(Intent(this@MainActivity, StreamService::class.java).setAction(StreamService.ACTION_STOP))
                             else {
@@ -45,7 +45,7 @@ class MainActivity : ComponentActivity() {
                                 startForegroundService(Intent(this@MainActivity, StreamService::class.java)
                                     .setAction(StreamService.ACTION_START).putExtra("server", server).putExtra("pin", pin))
                             }
-                        }, enabled = running || server.isNotBlank()) { Text(if (running) "Disconnect" else "Connect") }
+                        }, enabled = running || (server.isNotBlank() && pin.isNotBlank())) { Text(if (running) "Disconnect" else "Connect") }
                         Text(status)
                         if (found.isNotEmpty()) Text("Found on network", style = MaterialTheme.typography.titleMedium)
                         LazyColumn {
