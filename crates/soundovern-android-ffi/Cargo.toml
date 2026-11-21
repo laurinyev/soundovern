@@ -1,0 +1,13 @@
+[package]
+name = "soundovern-android-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jni = "0.21"
+soundovern-core = { version = "0.1.0", path = "../soundovern-core" }
+soundovern-proto = { version = "0.1.0", path = "../soundovern-proto" }
+
+[lib]
+crate-type = ["cdylib", "rlib"]

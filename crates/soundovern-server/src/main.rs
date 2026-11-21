@@ -1,0 +1,214 @@
+mod capture;
+mod session;
+mod silent;
+mod stream;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use soundovern_proto::*;
+use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(name = "soundovern-server", about = "Stream all desktop audio (PipeWire) to LAN clients")]
+struct Opt {
+    /// Address to bind the control listener on
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: IpAddr,
+    #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
+    port: u16,
+    /// Name advertised to clients
+    #[arg(long)]
+    name: Option<String>,
+    /// Require clients to present this PIN
+    #[arg(long)]
+    pin: Option<String>,
+    /// Capture a specific PipeWire node (name or id) instead of the default sink monitor
+    #[arg(long)]
+    target: Option<String>,
+    #[arg(long, default_value_t = 128_000)]
+    bitrate: u32,
+    /// Opus frame size in ms (5, 10 or 20)
+    #[arg(long, default_value_t = 10)]
+    frame_ms: u8,
+    #[arg(long)]
+    no_fec: bool,
+    #[arg(long)]
+    no_mdns: bool,
+    /// While a client is connected, don't play audio on this machine (route it to a null sink)
+    #[arg(long)]
+    silent_local: bool,
+    /// Capture for N seconds, print levels, optionally write a WAV, then exit
+    #[arg(long)]
+    probe: Option<u64>,
+    #[arg(long, requires = "probe")]
+    wav: Option<std::path::PathBuf>,
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "soundovern".into())
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
+    let opt = Opt::parse();
+    let params = StreamParams { frame_ms: opt.frame_ms, bitrate: opt.bitrate, fec: !opt.no_fec, ..Default::default() };
+    let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(capture::CaptureStats::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let cap_cfg = capture::CaptureConfig {
+        rate: params.sample_rate,
+        channels: params.channels as u32,
+        quantum: (params.frame_samples() as u32).max(128),
+        target: opt.target.clone(),
+    };
+    {
+        let (stats, stop) = (stats.clone(), stop.clone());
+        std::thread::Builder::new().name("pw-capture".into()).spawn(move || capture::run(cap_cfg, tx, stats, stop))?;
+    }
+
+    if let Some(secs) = opt.probe {
+        return probe(rx, secs, &params, opt.wav);
+    }
+
+    let name = opt.name.clone().unwrap_or_else(hostname);
+    let shared = Arc::new(session::Shared {
+        params: params.clone(),
+        server_name: name.clone(),
+        pin: opt.pin.clone(),
+        active: Mutex::new(None),
+        next_id: AtomicU16::new(1),
+        loss_hint: AtomicI32::new(0),
+    });
+
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("udp bind")?;
+    {
+        let s = socket2::SockRef::from(&sock);
+        let _ = s.set_tos_v4(0xB8); // DSCP EF: low-latency class (best effort, honoured by many APs)
+        let _ = s.set_send_buffer_size(256 * 1024);
+    }
+    {
+        let (sh, stop) = (shared.clone(), stop.clone());
+        std::thread::Builder::new().name("encoder".into()).spawn(move || stream::run(rx, sock, sh, stop))?;
+    }
+
+    let listener = TcpListener::bind((opt.bind, opt.port)).with_context(|| format!("bind {}:{}", opt.bind, opt.port))?;
+    tracing::info!("listening on {}:{} as '{name}' ({} kbps, {} ms frames)", opt.bind, opt.port, params.bitrate / 1000, params.frame_ms);
+    if let Some(ip) = local_ip() {
+        tracing::info!("connect clients to {ip}:{}", opt.port);
+    }
+    let _mdns = if opt.no_mdns { None } else { advertise(&name, opt.port, opt.pin.is_some()) };
+
+    if opt.silent_local {
+        let silent = Arc::new(Mutex::new(silent::SilentLocal::default()));
+        let s2 = silent.clone();
+        ctrlc::set_handler(move || {
+            s2.lock().unwrap().restore();
+            std::process::exit(0);
+        })?;
+        let sh = shared.clone();
+        std::thread::Builder::new().name("silent-local".into()).spawn(move || loop {
+            let has_client = sh.active.lock().unwrap().is_some();
+            let mut g = silent.lock().unwrap();
+            if has_client && !g.active() {
+                g.engage();
+            } else if !has_client && g.active() {
+                g.restore();
+            }
+            drop(g);
+            std::thread::sleep(Duration::from_millis(300));
+        })?;
+    }
+
+    {
+        let (st, stats) = (stop.clone(), stats.clone());
+        std::thread::spawn(move || {
+            while !st.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(10));
+                tracing::debug!(
+                    "capture: {} samples, {} overruns, {} restarts",
+                    stats.samples.load(Ordering::Relaxed),
+                    stats.overruns.load(Ordering::Relaxed),
+                    stats.restarts.load(Ordering::Relaxed)
+                );
+            }
+        });
+    }
+    session::serve(listener, shared);
+    Ok(())
+}
+
+fn local_ip() -> Option<IpAddr> {
+    // Route-based detection; no packets are sent for a UDP connect().
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    s.local_addr().ok().map(|a| a.ip())
+}
+
+fn advertise(name: &str, port: u16, pin: bool) -> Option<mdns_sd::ServiceDaemon> {
+    let d = mdns_sd::ServiceDaemon::new().ok()?;
+    let host = format!("{}.local.", hostname());
+    let props = [("ver", PROTO_VERSION.to_string()), ("pin", (pin as u8).to_string())];
+    let info = mdns_sd::ServiceInfo::new(MDNS_SERVICE, name, &host, "", port, &props[..]).ok()?.enable_addr_auto();
+    d.register(info).ok()?;
+    tracing::info!("mDNS: advertising {MDNS_SERVICE}");
+    Some(d)
+}
+
+fn probe(rx: std::sync::mpsc::Receiver<rtrb::Consumer<f32>>, secs: u64, p: &StreamParams, wav: Option<std::path::PathBuf>) -> Result<()> {
+    let mut cons = rx.recv_timeout(Duration::from_secs(5)).context("capture thread did not start")?;
+    let ch = p.channels as usize;
+    let mut all: Vec<f32> = Vec::new();
+    let end = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut peak = 0f32;
+    while std::time::Instant::now() < end {
+        while let Ok(c) = rx.try_recv() {
+            cons = c;
+        }
+        let n = cons.slots();
+        if n > 0 {
+            let chunk = cons.read_chunk(n).unwrap();
+            let (a, b) = chunk.as_slices();
+            for v in a.iter().chain(b) {
+                peak = peak.max(v.abs());
+            }
+            if wav.is_some() {
+                all.extend_from_slice(a);
+                all.extend_from_slice(b);
+            }
+            chunk.commit_all();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    println!("probe: peak amplitude over {secs}s = {peak:.4}  ({})", if peak > 0.0005 { "audio detected" } else { "silence - is anything playing?" });
+    if let Some(path) = wav {
+        write_wav(&path, &all, p.sample_rate, ch as u16)?;
+        println!("wrote {} ({} frames)", path.display(), all.len() / ch);
+    }
+    Ok(())
+}
+
+fn write_wav(path: &std::path::Path, samples: &[f32], rate: u32, ch: u16) -> Result<()> {
+    use std::io::Write;
+    let data_len = (samples.len() * 4) as u32;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&3u16.to_le_bytes())?; // IEEE float
+    f.write_all(&ch.to_le_bytes())?;
+    f.write_all(&rate.to_le_bytes())?;
+    f.write_all(&(rate * ch as u32 * 4).to_le_bytes())?;
+    f.write_all(&(ch * 4).to_le_bytes())?;
+    f.write_all(&32u16.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data_len.to_le_bytes())?;
+    for s in samples {
+        f.write_all(&s.to_le_bytes())?;
+    }
+    Ok(())
+}
