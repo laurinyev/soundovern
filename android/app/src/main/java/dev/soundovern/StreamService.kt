@@ -11,6 +11,20 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlin.concurrent.thread
 
+enum class Phase { IDLE, CONNECTING, PLAYING, RECONNECTING, FAILED }
+
+/** Snapshot the UI renders. */
+data class Stats(
+    val phase: Phase = Phase.IDLE,
+    val message: String = "",
+    val jitterMs: Float = 0f,
+    val outMs: Float = 0f,
+    val exclusive: Boolean = false,
+    val lost: Int = 0,
+    val underruns: Int = 0,
+    val xruns: Int = 0,
+)
+
 /** Foreground service: owns the engine handle; audio is rendered by the native Oboe stream. */
 class StreamService : Service() {
     companion object {
@@ -22,13 +36,14 @@ class StreamService : Service() {
 
         /** Observable by the UI. */
         @Volatile var status: String = "Idle"
+        @Volatile var stats: Stats = Stats()
+        @Volatile var muted: Boolean = false
         @Volatile var running: Boolean = false
         @Volatile var handle: Long = 0
     }
 
     private var audioThread: Thread? = null
     @Volatile private var stopping = false
-    @Volatile private var muted = false
     private var focus: AudioFocusRequest? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -47,8 +62,9 @@ class StreamService : Service() {
     }
 
     private fun begin(server: String, pin: String) {
-        running = true; stopping = false
+        running = true; stopping = false; muted = false
         status = "Connecting…"
+        stats = Stats(Phase.CONNECTING)
         createChannel()
         val n = notification("Connecting to $server")
         if (Build.VERSION.SDK_INT >= 29)
@@ -64,13 +80,13 @@ class StreamService : Service() {
         audioThread = thread(name = "sn-engine") {
             val h = NativeEngine.nativeStart(server, pin, Build.MODEL, 20, 120)
             if (h == 0L) {
-                status = "Failed: ${NativeEngine.nativeLastError()}"
+                fail(NativeEngine.nativeLastError())
                 shutdown(); return@thread
             }
             handle = h
             val audio = NativeEngine.nativeAudioStart(h)
             if (audio == 0L) {
-                status = "Failed: ${NativeEngine.nativeLastError()}"
+                fail(NativeEngine.nativeLastError())
                 NativeEngine.nativeStop(h); handle = 0
                 shutdown(); return@thread
             }
@@ -85,6 +101,11 @@ class StreamService : Service() {
         }
     }
 
+    private fun fail(msg: String) {
+        status = "Failed: $msg"
+        stats = Stats(Phase.FAILED, message = msg)
+    }
+
     private fun updateStatus(h: Long, audio: Long) {
         val s = NativeEngine.nativeStats(h)
         val a = NativeEngine.nativeAudioInfo(audio)
@@ -94,6 +115,11 @@ class StreamService : Service() {
             1 -> "Reconnecting…"
             else -> "Stopped"
         }
+        stats = Stats(
+            phase = when (s[0].toInt()) { 0 -> Phase.PLAYING; 1 -> Phase.RECONNECTING; else -> Phase.IDLE },
+            jitterMs = s[6], outMs = a[0], exclusive = a[4] > 0f,
+            lost = s[2].toInt(), underruns = s[4].toInt(), xruns = a[3].toInt(),
+        )
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notification(status))
         if (++statusTick % 5 == 0) Log.i("soundovern", "status: $status (burst ${a[2].toInt()} fr, buffer ${a[1].toInt()} fr, reopens ${a[5].toInt()})")
     }
@@ -152,7 +178,7 @@ class StreamService : Service() {
         wifiLock?.takeIf { it.isHeld }?.release()
         wakeLock?.takeIf { it.isHeld }?.release()
         running = false
-        if (!status.startsWith("Failed")) status = "Idle"
+        if (stats.phase != Phase.FAILED) { status = "Idle"; stats = Stats() }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
