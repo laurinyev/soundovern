@@ -7,4 +7,4 @@ license.workspace = true
 [dependencies]
 opus = "0.4.0"
 soundovern-proto = { version = "0.1.0", path = "../soundovern-proto" }
-tracing = "0.1.44"
+tracing = { version = "0.1.44", features = ["log"] }

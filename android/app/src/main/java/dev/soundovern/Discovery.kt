@@ -18,7 +18,9 @@ class Discovery(ctx: Context, private val onChange: (List<Found>) -> Unit) {
                 @Suppress("DEPRECATION")
                 nsd.resolveService(s, object : NsdManager.ResolveListener {
                     override fun onServiceResolved(r: NsdServiceInfo) {
-                        val host = r.host?.hostAddress ?: return
+                        // The server listens on IPv4 only; IPv6 link-local addresses can't be dialled without a scope id.
+                        val addrs = if (android.os.Build.VERSION.SDK_INT >= 34) r.hostAddresses else listOfNotNull(r.host)
+                        val host = addrs.firstOrNull { it is java.net.Inet4Address }?.hostAddress ?: return
                         synchronized(found) { found[r.serviceName] = Found(r.serviceName, host, r.port); onChange(found.values.toList()) }
                     }
                     override fun onResolveFailed(s: NsdServiceInfo, code: Int) {}

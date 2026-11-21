@@ -7,6 +7,7 @@ import android.content.pm.ServiceInfo
 import android.media.*
 import android.net.wifi.WifiManager
 import android.os.*
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlin.concurrent.thread
 
@@ -94,7 +95,10 @@ class StreamService : Service() {
             else -> "Stopped"
         }
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, notification(status))
+        if (++statusTick % 5 == 0) Log.i("soundovern", "status: $status (burst ${a[2].toInt()} fr, buffer ${a[1].toInt()} fr, reopens ${a[5].toInt()})")
     }
+
+    private var statusTick = 0
 
     private fun setMuted(m: Boolean) {
         muted = m

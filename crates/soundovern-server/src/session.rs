@@ -3,7 +3,7 @@ use anyhow::Result;
 use soundovern_proto::crypto::{self, MediaCipher};
 use soundovern_proto::*;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicI32, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,24 @@ pub struct ActiveSession {
     pub media_addr: SocketAddr,
     pub client_name: String,
     pub media: MediaCipher,
+}
+
+/// Last receiver report from the client (server logs it in its periodic status line).
+#[derive(Clone, Copy, Default)]
+pub struct ClientReport {
+    pub received: u32,
+    pub lost: u32,
+    pub late: u32,
+    pub jitter_ms: f32,
+    pub buffer_ms: f32,
+}
+
+#[derive(Default)]
+pub struct Metrics {
+    pub sent_packets: AtomicU64,
+    pub sent_bytes: AtomicU64,
+    pub send_errors: AtomicU64,
+    pub report: Mutex<Option<ClientReport>>,
 }
 
 #[derive(Default)]
@@ -29,12 +47,13 @@ pub struct Shared {
     pub next_id: AtomicU16,
     /// Loss percentage derived from client reports; the encoder reads this to tune FEC.
     pub loss_hint: AtomicI32,
+    pub metrics: Metrics,
     fails: Mutex<FailState>,
 }
 
 impl Shared {
     pub fn new(params: StreamParams, server_name: String, pin: String) -> Self {
-        Shared { params, server_name, pin, active: Mutex::new(None), next_id: AtomicU16::new(1), loss_hint: AtomicI32::new(0), fails: Mutex::new(FailState::default()) }
+        Shared { params, server_name, pin, active: Mutex::new(None), next_id: AtomicU16::new(1), loss_hint: AtomicI32::new(0), metrics: Metrics::default(), fails: Mutex::new(FailState::default()) }
     }
 
     fn lockout_remaining(&self) -> Option<Duration> {
@@ -121,6 +140,7 @@ fn handle(mut s: TcpStream, sh: Arc<Shared>) -> Result<()> {
                     let total = (received + lost).max(1);
                     let pct = (lost as f32 * 100.0 / total as f32).round() as i32;
                     sh.loss_hint.store(pct, Ordering::Relaxed);
+                    *sh.metrics.report.lock().unwrap() = Some(ClientReport { received, lost, late, jitter_ms, buffer_ms });
                     tracing::debug!("stats: rx={received} lost={lost} late={late} jitter={jitter_ms:.1}ms buf={buffer_ms:.0}ms");
                 }
                 Ok(Control::Stop) => return Ok(()),
@@ -136,6 +156,7 @@ fn handle(mut s: TcpStream, sh: Arc<Shared>) -> Result<()> {
     let mut g = sh.active.lock().unwrap();
     if g.as_ref().map(|a| a.id) == Some(id) {
         *g = None;
+        *sh.metrics.report.lock().unwrap() = None;
     }
     tracing::info!("session {id} closed");
     result

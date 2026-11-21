@@ -77,13 +77,13 @@ impl AudioOutputCallback for Callback {
 }
 
 fn tracing_log(msg: &str) {
-    // The core crate logs through `tracing`, which has no subscriber on Android; use stderr (-> logcat).
-    eprintln!("soundovern: {msg}");
+    tracing::info!("{msg}");
 }
 
 type Stream = AudioStreamAsync<Output, Callback>;
 
-fn open(engine: &Arc<Engine>, info: &Arc<Info>) -> Result<Stream, Error> {
+/// Open (but do not start) a stream. Records its properties in `info`.
+fn open_unstarted(engine: &Arc<Engine>, info: &Arc<Info>) -> Result<Stream, Error> {
     let cb = Callback { engine: engine.clone(), info: info.clone(), scratch: Vec::new(), calls: 0, last_xruns: 0 };
     let mut stream = AudioStreamBuilder::default()
         .set_performance_mode(PerformanceMode::LowLatency)
@@ -104,15 +104,21 @@ fn open(engine: &Arc<Engine>, info: &Arc<Info>) -> Result<Stream, Error> {
     info.buffer_frames.store(stream.get_buffer_size_in_frames(), Ordering::Relaxed);
     info.exclusive.store(stream.get_sharing_mode() == SharingMode::Exclusive, Ordering::Relaxed);
     info.restart.store(false, Ordering::Relaxed);
-    stream.start()?;
     tracing_log(&format!(
-        "oboe open: burst={burst} buffer={} cap={cap} sharing={:?} perf={:?} rate={}",
+        "oboe open: api={:?} burst={burst} buffer={} cap={cap} sharing={:?} perf={:?} rate={}",
+        stream.get_audio_api(),
         stream.get_buffer_size_in_frames(),
         stream.get_sharing_mode(),
         stream.get_performance_mode(),
         stream.get_sample_rate()
     ));
     Ok(stream)
+}
+
+fn open(engine: &Arc<Engine>, info: &Arc<Info>) -> Result<Stream, Error> {
+    let mut s = open_unstarted(engine, info)?;
+    s.start()?;
+    Ok(s)
 }
 
 pub struct AudioOut {
@@ -132,6 +138,7 @@ impl AudioOut {
             .name("sn-audio-sup".into())
             .spawn(move || {
                 let mut tick = 0u32;
+                let mut exclusive_tries = 0u32;
                 while !stop2.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(250));
                     tick += 1;
@@ -144,6 +151,29 @@ impl AudioOut {
                                 *g = Some(s);
                             }
                             Err(e) => tracing_log(&format!("reopen failed: {e:?}")),
+                        }
+                    } else if !info2.exclusive.load(Ordering::Relaxed) && tick % 16 == 0 && exclusive_tries < 15 {
+                        // The fast (exclusive/MMAP) path wasn't available at open time; it often frees up a
+                        // moment later. Try again on the side and swap only if we really get exclusive.
+                        exclusive_tries += 1;
+                        let probe = Info::default();
+                        let probe = Arc::new(probe);
+                        match open_unstarted(&engine, &probe) {
+                            Ok(mut new) if new.get_sharing_mode() == SharingMode::Exclusive => {
+                                *g = None; // release the slow stream, then start the fast one
+                                if new.start().is_ok() {
+                                    info2.burst_frames.store(probe.burst_frames.load(Ordering::Relaxed), Ordering::Relaxed);
+                                    info2.buffer_frames.store(probe.buffer_frames.load(Ordering::Relaxed), Ordering::Relaxed);
+                                    info2.exclusive.store(true, Ordering::Relaxed);
+                                    info2.reopens.fetch_add(1, Ordering::Relaxed);
+                                    tracing_log(&format!("switched to exclusive stream after {exclusive_tries} tries"));
+                                    *g = Some(new);
+                                } else if let Ok(s) = open(&engine, &info2) {
+                                    *g = Some(s);
+                                }
+                            }
+                            Ok(_) => tracing_log(&format!("exclusive retry {exclusive_tries}/15: still shared")),
+                            Err(e) => tracing_log(&format!("exclusive retry {exclusive_tries}/15 failed: {e:?}")),
                         }
                     } else if tick % 4 == 0 {
                         if let Some(s) = g.as_mut() {

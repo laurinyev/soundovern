@@ -11,6 +11,19 @@ use soundovern_core::client::{ClientConfig, ConnState, Engine};
 use std::sync::{Arc, Mutex};
 
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+static LOG_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Route Rust `tracing`/`log` output and panics to logcat (tag `soundovern`).
+fn init_logging() {
+    LOG_INIT.call_once(|| {
+        #[cfg(target_os = "android")]
+        android_logger::init_once(android_logger::Config::default().with_tag("soundovern").with_max_level(log::LevelFilter::Debug));
+        std::panic::set_hook(Box::new(|info| {
+            log::error!("PANIC: {info}");
+        }));
+        tracing::info!("soundovern native {} loaded (protocol v{})", env!("CARGO_PKG_VERSION"), soundovern_proto::PROTO_VERSION);
+    });
+}
 
 fn set_err(s: String) {
     *LAST_ERROR.lock().unwrap() = s;
@@ -32,15 +45,18 @@ pub extern "system" fn Java_dev_soundovern_NativeEngine_nativeStart(
     min_ms: jint,
     max_ms: jint,
 ) -> jlong {
+    init_logging();
     let get = |env: &mut JNIEnv, s: &JString| -> String { env.get_string(s).map(|s| s.into()).unwrap_or_default() };
     let mut cfg = ClientConfig::new(get(&mut env, &server));
     cfg.pin = get(&mut env, &pin);
     cfg.client_name = get(&mut env, &name);
     cfg.min_ms = min_ms.max(10) as u32;
     cfg.max_ms = max_ms.max(min_ms + 10) as u32;
+    tracing::info!("starting engine for {} (min {} ms, max {} ms)", cfg.server, cfg.min_ms, cfg.max_ms);
     match Engine::start(cfg) {
         Ok(e) => Arc::into_raw(e) as jlong,
         Err(msg) => {
+            tracing::error!("engine start failed: {msg}");
             set_err(msg);
             0
         }

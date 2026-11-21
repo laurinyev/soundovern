@@ -121,19 +121,36 @@ fn main() -> Result<()> {
         })?;
     }
 
+    // Periodic status line (every 5 s while a client is connected; at debug level when idle).
     {
-        let (st, stats) = (stop.clone(), stats.clone());
-        std::thread::spawn(move || {
+        let (st, stats, sh) = (stop.clone(), stats.clone(), shared.clone());
+        std::thread::Builder::new().name("status".into()).spawn(move || {
+            let (mut last_pkts, mut last_bytes, mut last) = (0u64, 0u64, std::time::Instant::now());
             while !st.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(10));
-                tracing::debug!(
-                    "capture: {} samples, {} overruns, {} restarts",
-                    stats.samples.load(Ordering::Relaxed),
+                std::thread::sleep(Duration::from_secs(5));
+                let pkts = sh.metrics.sent_packets.load(Ordering::Relaxed);
+                let bytes = sh.metrics.sent_bytes.load(Ordering::Relaxed);
+                let dt = last.elapsed().as_secs_f64().max(0.001);
+                let (pps, kbps) = ((pkts - last_pkts) as f64 / dt, (bytes - last_bytes) as f64 * 8.0 / dt / 1000.0);
+                (last_pkts, last_bytes, last) = (pkts, bytes, std::time::Instant::now());
+                let cap = format!(
+                    "capture: {} overruns, {} restarts, send errors {}",
                     stats.overruns.load(Ordering::Relaxed),
-                    stats.restarts.load(Ordering::Relaxed)
+                    stats.restarts.load(Ordering::Relaxed),
+                    sh.metrics.send_errors.load(Ordering::Relaxed)
                 );
+                match sh.active.lock().unwrap().clone() {
+                    Some(a) => {
+                        let rep = match *sh.metrics.report.lock().unwrap() {
+                            Some(r) => format!("client: rx {} lost {} late {} jitter {:.1} ms buf {:.0} ms", r.received, r.lost, r.late, r.jitter_ms, r.buffer_ms),
+                            None => "client: no report yet".into(),
+                        };
+                        tracing::info!("[session {} '{}' {}] tx {pps:.0} pkt/s {kbps:.0} kbit/s | {rep} | {cap}", a.id, a.client_name, a.media_addr);
+                    }
+                    None => tracing::debug!("idle | {cap}"),
+                }
             }
-        });
+        })?;
     }
     session::serve(listener, shared);
     Ok(())

@@ -98,7 +98,15 @@ fn resolve(server: &str) -> std::io::Result<SocketAddr> {
     } else {
         format!("{server}:{DEFAULT_CONTROL_PORT}")
     };
-    s.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot resolve server"))
+    // The server listens on IPv4 only, and a bare IPv6 link-local address (fe80::...) can't be
+    // connected to without a scope id (EINVAL), so always prefer an IPv4 address.
+    let addrs: Vec<SocketAddr> = s.to_socket_addrs()?.collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot resolve server"))
 }
 
 struct Connected {
@@ -110,7 +118,13 @@ struct Connected {
 
 /// TCP connect + SPAKE2 handshake. Fails with a readable message for a wrong PIN or refusal.
 fn connect(addr: SocketAddr, udp_port: u16, cfg: &ClientConfig) -> Result<Connected, String> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| format!("connect: {e}"))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| {
+        if addr.is_ipv6() {
+            format!("connect to {addr}: {e} (IPv6 isn't supported; use the server's IPv4 address)")
+        } else {
+            format!("connect to {addr}: {e}")
+        }
+    })?;
     let _ = s.set_nodelay(true);
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let (pending, my_msg) = crypto::client_start(&cfg.pin);
@@ -263,7 +277,12 @@ fn control_loop(eng: Arc<Engine>, mut ctl: TcpStream, mut sess: Session, addr: S
             let g = eng.jb.lock().unwrap();
             (g.stats, g.jitter_ms(), g.buffered_ms())
         };
-        tracing::info!("rx={} lost={} late={} underruns={} jitter={jitter:.1}ms buf={buf:.0}ms", stats.received, stats.lost, stats.late, stats.underruns);
+        if nonce % 5 == 0 {
+            tracing::info!(
+                "rx={} lost={} late={} underruns={} overflows={} resyncs={} jitter={jitter:.1}ms buf={buf:.0}ms target={}fr",
+                stats.received, stats.lost, stats.late, stats.underruns, stats.overflows, stats.resyncs, eng.jb.lock().unwrap().target()
+            );
+        }
         let res = (|| -> std::io::Result<()> {
             sess.write_to(&mut ctl, &Control::Ping { nonce })?;
             sess.write_to(

@@ -90,8 +90,16 @@ pub fn run(rx: Receiver<rtrb::Consumer<f32>>, sock: std::net::UdpSocket, sh: Arc
         discont = false;
         seq = seq.wrapping_add(1);
         ts += params.frame_samples() as u64;
-        if let Err(e) = sock.send_to(&pkt, sess.media_addr) {
-            tracing::debug!("udp send: {e}");
+        match sock.send_to(&pkt, sess.media_addr) {
+            Ok(n) => {
+                sh.metrics.sent_packets.fetch_add(1, Ordering::Relaxed);
+                sh.metrics.sent_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if sh.metrics.send_errors.fetch_add(1, Ordering::Relaxed) % 100 == 0 {
+                    tracing::warn!("udp send to {} failed: {e}", sess.media_addr);
+                }
+            }
         }
     }
 }

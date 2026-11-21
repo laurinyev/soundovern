@@ -6,11 +6,14 @@ license.workspace = true
 
 [dependencies]
 jni = "0.21"
+log = "0.4.35"
 soundovern-core = { version = "0.1.0", path = "../soundovern-core" }
 soundovern-proto = { version = "0.1.0", path = "../soundovern-proto" }
+tracing = "0.1.44"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15.1"
 oboe = "0.6.1"
